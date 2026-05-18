@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(Get-ChildItem -Path \"C:\\\\Users\\\\rajanbir\\\\EXIQO Challenge\\\\ai_sdlc_copilot\" -Recurse -Force)",
+      "Bash(Select-Object -Property FullName)",
+      "Bash(Sort-Object FullName)",
+      "Bash(python -m pytest tests/ -x -q)",
+      "Bash(python -m pytest tests/ -q --tb=short)",
+      "Bash(python -m pytest tests/test_registry.py tests/test_ingestion.py tests/test_executor.py -q --tb=short)",
+      "Bash(python -m pytest tests/test_registry.py tests/test_ingestion.py -v --tb=short)",
+      "Bash(python -m pytest tests/test_executor.py -v --tb=short)",
+      "Bash(python -m pytest tests/test_executor.py tests/test_orchestrator.py tests/test_ingestion.py tests/test_registry.py -v --tb=short)",
+      "Bash(python -m pytest tests/test_pipeline.py tests/test_api.py tests/test_exporters.py -v --tb=short)",
+      "Bash(python -m pytest tests/test_exporters.py -v --tb=short)",
+      "Bash(python -m pytest tests/ -v --tb=short)"
+    ]
+  }
+}
