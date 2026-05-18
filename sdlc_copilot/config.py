@@ -1,8 +1,24 @@
+import os
 from functools import lru_cache
 from pathlib import Path
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# On Vercel (and similar serverless platforms) only /tmp is writable.
+_TMP = Path("/tmp")
+_IS_SERVERLESS = os.getenv("VERCEL") == "1" or not os.access(".", os.W_OK)
+
+
+def _writable_path(preferred: Path) -> Path:
+    """Return preferred path when writable, otherwise redirect to /tmp."""
+    try:
+        preferred.mkdir(parents=True, exist_ok=True)
+        return preferred
+    except OSError:
+        fallback = _TMP / preferred.name
+        fallback.mkdir(parents=True, exist_ok=True)
+        return fallback
 
 
 class Settings(BaseSettings):
@@ -46,8 +62,9 @@ class Settings(BaseSettings):
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
     settings = Settings()
-    settings.chroma_persist_dir.mkdir(parents=True, exist_ok=True)
-    settings.artifact_dir.mkdir(parents=True, exist_ok=True)
+    # Use writable paths — on serverless envs (Vercel) this redirects to /tmp.
+    settings.chroma_persist_dir = _writable_path(settings.chroma_persist_dir)
+    settings.artifact_dir = _writable_path(settings.artifact_dir)
     if settings.agent_logs_enabled:
-        settings.log_dir.mkdir(parents=True, exist_ok=True)
+        settings.log_dir = _writable_path(settings.log_dir)
     return settings

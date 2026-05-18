@@ -22,17 +22,27 @@ from sdlc_copilot.models import PipelineRequest, PipelineResponse
 from sdlc_copilot.services.pipeline import SDLCPipelineService
 
 log = logging.getLogger(__name__)
-settings = get_settings()
 
 PRISM_UI_DIR = Path(__file__).resolve().parent.parent / "prism_ui"
+
+# Defer settings init so import errors surface as a proper HTTP 500 with a log message
+# rather than crashing the entire Vercel function at cold-start.
+try:
+    settings = get_settings()
+except Exception as _settings_exc:  # noqa: BLE001
+    logging.basicConfig(level="ERROR")
+    logging.error("Failed to load settings: %s", _settings_exc)
+    settings = None  # type: ignore[assignment]
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    configure_logging(settings.sdlc_log_level)
-    log.info("%s v%s starting (LLM_PROVIDER=%s)", settings.app_name, __version__, settings.llm_provider)
+    if settings is not None:
+        configure_logging(settings.sdlc_log_level)
+        log.info("%s v%s starting (LLM_PROVIDER=%s)", settings.app_name, __version__, settings.llm_provider)
     yield
-    log.info("%s shutdown", settings.app_name)
+    if settings is not None:
+        log.info("%s shutdown", settings.app_name)
 
 
 app = FastAPI(
