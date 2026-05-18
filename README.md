@@ -64,12 +64,6 @@ sdlc-copilot interactive                                 # guided; end text with
 sdlc-copilot -v interactive                              # DEBUG logs
 ```
 
-### Streamlit UI
-```bash
-streamlit run streamlit_app/app.py
-# Input → Progress (live streaming) → Results (tabbed by artifact) → Export
-```
-
 ### Tests
 ```bash
 pytest          # 70 tests, no real API calls needed
