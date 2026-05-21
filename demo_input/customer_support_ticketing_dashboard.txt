@@ -1,0 +1,121 @@
+Fwd: Customer Support Ticketing Dashboard - need your input before we commit dates
+From: Geetanjali Dhoke <geetanjali.dhoke@company.com>
+To: eng-data@internal; support-leads@internal
+Date: Tue, 18 Mar 2026 11:04
+
+Team,
+
+Attaching notes from the BRD workshop (PDF went around last week - same content, this is the messy version).
+Support leadership wants ONE dashboard for KPIs instead of everyone exporting csv from zendesk every monday.
+
+@Ravi - we are NOT building a new ticketing system. read that again. dashboard only.
+
+Tooling:
+- zendesk is what support uses today (freshdesk was mentioned by vendor mgmt but support lead said no)
+- API access: IT ticket opened ZENDESK-4412, status "waiting on vendor" last I checked
+- if API blocked we might only get nightly csv dump to s3 (data eng prefers not but need plan B)
+
+---
+
+What leadership wants on screen (paraphrased from BRD + call):
+
+1) ticket volume - created / resolved / reopened - daily weekly monthly toggle
+2) SLA breaches - response SLA and resolution SLA (two different timers in zendesk, people mix them up)
+3) backlog - open/pending by category (category list not finalized)
+4) agent performance - resolution time, closure rate per agent
+5) CSAT - only if source has it (zendesk survey module is ON but data quality is bad for feb)
+6) drill down filters - team, agent, issue type, priority
+
+Geetanjali's BRD also said:
+- refresh at least hourly (ops asked for 15 min during business hours - not in signed scope yet)
+- role based access
+- must work desktop + mobile (support manager checks phone at night apparently)
+- handle "high volume" - nobody gave a number. Tom guessed 50k tickets/month historical.
+
+---
+
+Out of scope (do not build):
+- creating tickets manually in our app
+- CRM changes
+- buying tableau/licenses (company has Power BI already - use that unless architecture says otherwise)
+
+---
+
+Stakeholders (names still placeholders in BRD doc):
+
+Support Manager - [Support Lead Name]  <- need real name for UAT
+Business Analyst - Geetanjali Dhoke
+Data Engineer - [Engineer Name]  <- hiring req open
+BI Developer - [Developer Name]
+
+Geetanjali's timeline from BRD (support lead thinks unrealistic):
+
+Requirements 3 days
+Data integration 4 days
+Dashboard dev 6 days
+Testing 3 days
+Go live 1 day
+
+Raj from support: "17 days total is fantasy if zendesk API is not ready"
+
+---
+
+Assumptions / dependencies (from BRD - validate these):
+
+- SLA policies defined by support (they have draft doc v0.3, not approved)
+- data comes structured json/csv from source
+- BI licenses exist (Power BI pro seats - 12 available per IT)
+
+---
+
+Risks people raised on call:
+
+- API rate limits / zendesk outage -> need retry + fallback (BRD says high impact)
+- data inconsistency between zendesk exports (medium)
+- users don't trust dashboards -> training sessions (medium)
+- scope creep -> Geetanjali wants change request form (high)
+
+---
+
+Slack #support-dashboard (copy paste):
+
+"can we add customer name on drill down" - legal said PII review required
+"want red highlight when SLA breach > 10% of queue" - nice visual, not must have
+"export to excel button?" - v2 maybe
+"why CSAT chart empty for EMEA team" - data issue not UI bug probably
+
+---
+
+Technical notes from architecture chat:
+
+- pull data to warehouse first (snowflake schema support_mart) then Power BI connects there
+- do not query zendesk live from PBI on every click
+- auth: SSO with Azure AD groups -> Support_Manager, Support_Agent(read only?), Exec_ReadOnly
+- audit who exported what - compliance ask for Q2
+
+---
+
+UAT criteria (rough):
+
+- numbers match zendesk report SR-12 for same date range (within 2% tolerance?)
+- SLA breach count matches sample of 20 tickets checked manually
+- mobile layout readable on iphone (support manager device)
+
+---
+
+Open items (please answer in next grooming):
+
+?? which zendesk fields map to "issue type"
+?? reopened definition - status change or new ticket linked?
+?? go-live date - april 30 aspirational, may 15 realistic?
+?? do we need hindi labels on charts - support said english only for v1
+
+---
+
+Reference: Business Requirements Document (BRD) - Customer Support Ticketing Dashboard
+Prepared By: Geetanjali Dhoke
+Project: centralized reporting on ticket volumes, resolution times, backlog, SLA compliance
+
+Contact Geetanjali for BRD PDF if needed.
+
+- forwarded by Tom (PM)
