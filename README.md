@@ -8,9 +8,11 @@ Multi-agent AI pipeline that converts requirement documents into a full SDLC art
 - **LangGraph conditional routing** — low-confidence outputs automatically route to `feedback_refinement` before continuing; toggle with `USE_LANGGRAPH=true`
 - **Automated feedback refinement** — no human-in-the-loop blocking; the agent summarises weak outputs and adds clarifying assumptions
 - **Export** — JSON, CSV, and PDF (`GET /runs/{run_id}/export?format=pdf`)
-- **Streamlit UI** — `streamlit run streamlit_app/app.py` for a guided demo
+- **Static web UI** — `prism_ui/` (vanilla HTML/JS) served by the FastAPI app at `/`
+- **Filename-keyed agent cache** — head-agent outputs are replayed from `.data/cache/{filename}.json` on repeat uploads; toggle "Force refresh" in the UI to bypass it
+- **Human-in-the-loop checkpoints** — UI pauses for sprint + project duration before `sprint_planning` and for editable team-allocation review after `team_allocation`
 - **REST API + CLI** — FastAPI at `/docs`, Typer CLI via `sdlc-copilot`
-- **70 unit/integration tests** — all run without real API keys
+- **111 unit/integration tests** — all run without real API keys
 
 ## Quick Start
 
@@ -66,7 +68,7 @@ sdlc-copilot -v interactive                              # DEBUG logs
 
 ### Tests
 ```bash
-pytest          # 70 tests, no real API calls needed
+pytest          # 111 tests, no real API calls needed
 ruff check .
 mypy sdlc_copilot
 ```
@@ -81,6 +83,9 @@ mypy sdlc_copilot
 | `POST` | `/runs/upload` | Run pipeline from uploaded files |
 | `GET` | `/runs/{run_id}` | Retrieve a persisted run |
 | `GET` | `/runs/{run_id}/export` | Download as `json`, `csv`, or `pdf` |
+| `POST` | `/api/ayra/runs/stream` | Phase 1 SSE: head agents, ends with `requires_input` |
+| `POST` | `/api/ayra/runs/{run_id}/plan` | Phase 2 SSE: sprint + team allocation, ends with `requires_team_review` |
+| `POST` | `/api/ayra/runs/{run_id}/finalize` | Phase 3 SSE: devops + compliance + export, ends with `done` |
 
 ## Architecture
 
@@ -104,8 +109,14 @@ sdlc_copilot/
     exporters.py     export_json / export_csv / export_pdf
   llm/providers.py   build_chat_model() — OpenRouter or Groq
   storage/           ChromaDB index per run_id
-streamlit_app/       pages: 1_Input, 2_Progress, 3_Results, 4_Export
-tests/               70 tests across executor, orchestrator, pipeline, ingestion, API, exporters
+  services/
+    pipeline.py      SDLCPipelineService.run() / .stream() + stream_head / stream_mid / stream_tail
+    agent_cache.py   Filename-keyed cache for head-agent outputs
+    run_sessions.py  In-memory PipelineState store keyed by run_id
+  api/
+    ayra_routes.py   /api/ayra/{config,message,runs/stream,runs/{id}/plan,runs/{id}/finalize}
+prism_ui/            Static frontend: index.html, app.js, styles.css
+tests/               111 tests across executor, orchestrator, pipeline, ingestion, API, exporters, cache, phases
 ```
 
 ## LangGraph Routing
@@ -120,6 +131,23 @@ START → [22 agents in order] → hallucination_validation
 ```
 
 `LangGraphState` uses `Annotated[dict, operator.or_]` reducers so each node only needs to return its own outputs — partial updates merge automatically.
+
+## Caching & HITL
+
+The `prism_ui` frontend drives a three-phase Server-Sent Events flow:
+
+```
+POST /api/ayra/runs/stream     # phase 1: head agents (cache replay if available)
+  -> SSE: requires_input       # UI prompts for sprint + project duration
+
+POST /api/ayra/runs/{id}/plan  # phase 2: sprint_planning + team_allocation
+  -> SSE: requires_team_review # UI shows editable assignments table
+
+POST /api/ayra/runs/{id}/finalize  # phase 3: devops + compliance + export
+  -> SSE: done                 # final artifact written to .data/artifacts/{id}.json
+```
+
+The 17 head agents (`requirement_extraction` … `traceability`) are cached at `.data/cache/{filename}.json`, keyed by the lowercased upload filename (multi-file uploads use sorted names joined with `|`). Subsequent uploads of the same filename(s) replay cached outputs without invoking the LLM. The UI "Force refresh" checkbox clears the cache file before phase 1. Raw-text-only requests are not cached.
 
 ## Agent IDs
 

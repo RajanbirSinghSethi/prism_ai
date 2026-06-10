@@ -1,18 +1,28 @@
 import logging
 from collections.abc import Iterable
+from typing import Any
 
 import orjson
 
 from sdlc_copilot.agents.agent_logger import AgentLogger
+from sdlc_copilot.agents.executor import SDLCSpecAgent
+from sdlc_copilot.agents.registry import DEFAULT_WORKFLOW, get_specs
 from sdlc_copilot.agents.validators import format_findings, validate_cross_agent_ids
 from sdlc_copilot.config import Settings, get_settings
 from sdlc_copilot.ingestion.preprocess import chunk_documents, clean_text
 from sdlc_copilot.llm.providers import build_chat_model
 from sdlc_copilot.models import PipelineRequest, PipelineResponse, PipelineState, SourceDocument
 from sdlc_copilot.orchestrator.workflow import SDLCOrchestrator
+from sdlc_copilot.services import agent_cache, run_sessions
 from sdlc_copilot.storage.vectorstore import index_chunks
 
 log = logging.getLogger(__name__)
+
+# Phase split for the human-in-the-loop flow. Head agents end with traceability;
+# sprint_planning + team_allocation are gated by user input; the tail wraps up.
+HEAD_AGENTS: list[str] = DEFAULT_WORKFLOW[: DEFAULT_WORKFLOW.index("sprint_planning")]
+MID_AGENTS: list[str] = ["sprint_planning", "team_allocation"]
+TAIL_AGENTS: list[str] = DEFAULT_WORKFLOW[DEFAULT_WORKFLOW.index("team_allocation") + 1 :]
 
 
 class SDLCPipelineService:
@@ -171,6 +181,154 @@ class SDLCPipelineService:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(orjson.dumps(state.model_dump(mode="json"), option=orjson.OPT_INDENT_2))
 
+    # ------------------------------------------------------------------
+    # Phased streaming (human-in-the-loop): head -> mid -> tail
+    # ------------------------------------------------------------------
+
+    def stream_head(
+        self,
+        request: PipelineRequest,
+        documents: list[SourceDocument] | None = None,
+        *,
+        force_refresh: bool = False,
+    ) -> Iterable[tuple[str, PipelineState, bool]]:
+        """Run (or replay from cache) the head agents.
+
+        Yields ``(agent_id, state, cached)`` after each head agent. The session
+        is registered with ``run_sessions`` so subsequent phases can resume it.
+        """
+        state = self._prepare_state(request, documents)
+        logger = self._build_agent_logger(state.run_id)
+        source_docs = list(documents or [])
+        source_filenames = [d.filename for d in source_docs if d.filename]
+        cache_key = agent_cache.cache_key_for(source_docs)
+
+        if force_refresh and cache_key:
+            agent_cache.clear(self.settings, cache_key)
+            log.info("Cache cleared for key=%s (force_refresh)", cache_key)
+
+        cached_outputs: dict[str, Any] = {}
+        if cache_key and not force_refresh:
+            cached_outputs = agent_cache.load(self.settings, cache_key)
+            if cached_outputs:
+                missing = [a for a in HEAD_AGENTS if a not in cached_outputs]
+                log.info(
+                    "Cache hit key=%s replay=%s re-run=%s",
+                    cache_key,
+                    len(cached_outputs),
+                    missing or "[]",
+                )
+
+        run_sessions.put(
+            state.run_id,
+            state,
+            cache_key=cache_key,
+            source_filenames=source_filenames,
+            settings=self.settings,
+        )
+
+        llm = build_chat_model(self.settings) if any(a not in cached_outputs for a in HEAD_AGENTS) else None
+        specs = {s.id: s for s in get_specs(HEAD_AGENTS)}
+
+        for order, agent_id in enumerate(HEAD_AGENTS):
+            cached = False
+            if agent_id in cached_outputs:
+                state.outputs[agent_id] = cached_outputs[agent_id]
+                cached = True
+                log.info("Agent CACHE replay: %s", agent_id)
+            else:
+                if llm is None:
+                    llm = build_chat_model(self.settings)
+                agent = SDLCSpecAgent(specs[agent_id], llm, logger=logger, order=order)
+                self._run_single_agent(agent, state)
+                output = state.outputs.get(agent_id)
+                if output is not None and cache_key and _is_cacheable(output):
+                    try:
+                        agent_cache.save_output(
+                            self.settings,
+                            cache_key,
+                            agent_id,
+                            output,
+                            source_filenames=source_filenames,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning("Cache write failed for %s/%s: %s", cache_key, agent_id, exc)
+                elif output is not None:
+                    log.info("Skipping cache write for %s (low-quality output)", agent_id)
+            yield agent_id, state, cached
+
+    def stream_mid(
+        self,
+        run_id: str,
+        *,
+        sprint_duration_weeks: int,
+        project_duration_weeks: int,
+    ) -> Iterable[tuple[str, PipelineState, bool]]:
+        """Run sprint_planning + team_allocation with user-supplied durations."""
+        session = run_sessions.get(run_id, settings=self.settings)
+        if session is None:
+            raise KeyError(f"Unknown run_id: {run_id}")
+        state = session.state
+        state.constraints = dict(state.constraints)
+        state.constraints["sprint_duration_weeks"] = int(sprint_duration_weeks)
+        state.constraints["project_duration_weeks"] = int(project_duration_weeks)
+
+        llm = build_chat_model(self.settings)
+        logger = self._build_agent_logger(state.run_id)
+        specs = {s.id: s for s in get_specs(MID_AGENTS)}
+
+        base_order = len(HEAD_AGENTS)
+        for offset, agent_id in enumerate(MID_AGENTS):
+            agent = SDLCSpecAgent(specs[agent_id], llm, logger=logger, order=base_order + offset)
+            self._run_single_agent(agent, state)
+            yield agent_id, state, False
+
+        # Persist updated session so tail phase survives a server restart too.
+        run_sessions._persist_current(run_id, self.settings)
+
+    def stream_tail(
+        self,
+        run_id: str,
+        *,
+        assignments: list[dict[str, Any]] | None = None,
+    ) -> Iterable[tuple[str, PipelineState, bool]]:
+        """Apply edited team assignments, then run the tail agents and persist."""
+        session = run_sessions.get(run_id, settings=self.settings)
+        if session is None:
+            raise KeyError(f"Unknown run_id: {run_id}")
+        state = session.state
+
+        if assignments is not None and "team_allocation" in state.outputs:
+            output = state.outputs["team_allocation"]
+            content = dict(output.content) if isinstance(output.content, dict) else {}
+            content["assignments"] = list(assignments)
+            output.content = content
+
+        llm = build_chat_model(self.settings)
+        logger = self._build_agent_logger(state.run_id)
+        specs = {s.id: s for s in get_specs(TAIL_AGENTS)}
+
+        base_order = len(HEAD_AGENTS) + len(MID_AGENTS)
+        try:
+            for offset, agent_id in enumerate(TAIL_AGENTS):
+                agent = SDLCSpecAgent(specs[agent_id], llm, logger=logger, order=base_order + offset)
+                self._run_single_agent(agent, state)
+                yield agent_id, state, False
+        finally:
+            self._run_cross_agent_validation(state)
+            self._persist(state)
+            run_sessions.discard(run_id, settings=self.settings)
+
+    @staticmethod
+    def _run_single_agent(agent: SDLCSpecAgent, state: PipelineState) -> None:
+        log.info("Agent start: %s", agent.spec.id)
+        try:
+            state.outputs[agent.spec.id] = agent.run(state)
+            log.info("Agent OK: %s", agent.spec.id)
+        except Exception as exc:  # noqa: BLE001 - preserve per-agent failures
+            state.errors[agent.spec.id] = str(exc)
+            log.error("Agent FAILED: %s — %s", agent.spec.id, exc, exc_info=True)
+
     def _index_context(self, state: PipelineState) -> None:
         log.info("Embedding index: %s chunks -> Chroma collection %s", len(state.chunks), state.run_id)
         try:
@@ -179,3 +337,26 @@ class SDLCPipelineService:
         except Exception as exc:  # noqa: BLE001 - embeddings are valuable, but should not block MVP runs.
             state.errors["embedding_index"] = str(exc)
             log.warning("Embedding index failed: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# Cache quality gate
+# ---------------------------------------------------------------------------
+
+# Risk strings written by SDLCSpecAgent._fallback_payload — outputs carrying
+# these markers are LLM/parse failures rather than real artifacts and must NOT
+# be cached, so the next run will re-attempt the agent.
+_FALLBACK_RISK_MARKERS = {
+    "Model returned non-JSON output after retry.",
+}
+
+
+def _is_cacheable(output: Any) -> bool:
+    """Return True if the agent output is real (not a JSON-parse fallback)."""
+    risks = getattr(output, "risks", None) or []
+    if any(r in _FALLBACK_RISK_MARKERS for r in risks):
+        return False
+    content = getattr(output, "content", None)
+    if isinstance(content, dict) and set(content.keys()) == {"raw"}:
+        return False
+    return True

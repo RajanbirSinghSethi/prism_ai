@@ -40,6 +40,7 @@ class Settings(BaseSettings):
     )
     chroma_persist_dir: Path = Field(default=Path(".data/chroma"), validation_alias="CHROMA_PERSIST_DIR")
     artifact_dir: Path = Field(default=Path(".data/artifacts"), validation_alias="ARTIFACT_DIR")
+    cache_dir: Path = Field(default=Path(".data/cache"), validation_alias="CACHE_DIR")
     log_dir: Path = Field(default=Path(".data/logs"), validation_alias="LOG_DIR")
     agent_logs_enabled: bool = Field(default=True, validation_alias="AGENT_LOGS_ENABLED")
     max_agent_retries: int = Field(default=2, validation_alias="MAX_AGENT_RETRIES")
@@ -65,6 +66,7 @@ def get_settings() -> Settings:
     # Use writable paths — on serverless envs (Vercel) this redirects to /tmp.
     settings.chroma_persist_dir = _writable_path(settings.chroma_persist_dir)
     settings.artifact_dir = _writable_path(settings.artifact_dir)
+    settings.cache_dir = _writable_path(settings.cache_dir)
     if settings.agent_logs_enabled:
         settings.log_dir = _writable_path(settings.log_dir)
     return settings

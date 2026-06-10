@@ -23,12 +23,34 @@ _JSON_REPAIR_USER = (
 # Per-agent context budget overrides. Override `max_context_chars` and
 # `max_prior_agents` for token-heavy or context-hungry agents so we don't
 # blow the model's TPM budget on the first few prompts.
+#
+# Tuning rationale (positions reference DEFAULT_WORKFLOW in registry.py):
+# - ambiguity_detection (pos 2) / missing_requirement (pos 3): cap to 2 prior
+#   agents (extraction + classification only) so responses stay under output limits.
+# - dependency_mapping (pos 7): only needs stories (pos 5) + tasks (pos 6).
+#   2 prior agents is sufficient and keeps the payload small.
+# - acceptance_criteria (pos 8): needs stories (pos 5) + tasks (pos 6) + dep map
+#   (pos 7). 3 prior agents covers exactly those three.
+# - effort_estimation (pos 9): needs tasks (pos 6) + dep map (pos 7) + AC (pos 8).
+#   3 prior agents is the minimal correct window.
+# - test_case_generation (pos 14): must reach acceptance_criteria at pos 8 —
+#   6 agents back. Window of 7 gives one extra for context.
+# - traceability (pos 16): must reach user_story_generation (pos 5) and
+#   task_decomposition (pos 6). 12 prior agents covers the full design+spec phase.
+# - hallucination_validation (pos 15): needs api_spec, task IDs, and stories —
+#   all within 12 agents back.
+# - compliance (pos 20): only needs req extraction + classification + security
+#   review. 4 prior agents is sufficient.
 _AGENT_CONTEXT_OVERRIDES: dict[str, dict[str, int]] = {
-    "acceptance_criteria":  {"max_context_chars": 3000, "max_prior_agents": 5},
-    "test_case_generation": {"max_context_chars": 2500, "max_prior_agents": 5},
-    "effort_estimation":    {"max_context_chars": 3500, "max_prior_agents": 6},
-    "traceability":         {"max_context_chars": 2000, "max_prior_agents": 8},
-    "compliance":           {"max_context_chars": 4500, "max_prior_agents": 4},
+    "ambiguity_detection":      {"max_context_chars": 2500, "max_prior_agents": 2},
+    "missing_requirement":      {"max_context_chars": 2500, "max_prior_agents": 2},
+    "dependency_mapping":       {"max_context_chars": 2000, "max_prior_agents": 2},
+    "acceptance_criteria":      {"max_context_chars": 2000, "max_prior_agents": 3},
+    "effort_estimation":        {"max_context_chars": 3000, "max_prior_agents": 3},
+    "test_case_generation":     {"max_context_chars": 2000, "max_prior_agents": 7},
+    "hallucination_validation": {"max_context_chars": 3000, "max_prior_agents": 12},
+    "traceability":             {"max_context_chars": 2000, "max_prior_agents": 12},
+    "compliance":               {"max_context_chars": 4500, "max_prior_agents": 4},
 }
 
 # Default output-shape hint keyed by ArtifactType.
@@ -70,28 +92,74 @@ _AGENT_HINTS: dict[str, str] = {
         'priority ∈ {P0, P1, P2, P3}. Do NOT repeat requirement_extraction verbatim — '
         'enrich every item with category and priority.'
     ),
+    "ambiguity_detection": (
+        'content MUST include "findings" (list of {id, requirement_id, description, suggestion}). '
+        'id format: AMB-1, AMB-2, etc. requirement_id MUST match an existing REQ-x.y ID. '
+        'Limit to at most 8 findings. Keep each description under 20 words. '
+        'CRITICAL: output ONLY a single compact JSON object — no preamble, no markdown, '
+        'no trailing text. Stop after the closing brace.'
+    ),
+    "missing_requirement": (
+        'content MUST include "gaps" (list of {id, area, description, suggested_requirement}). '
+        'id format: GAP-1, GAP-2, etc. Limit to at most 8 gaps. '
+        'Only reference areas not covered by the existing requirements. '
+        'Do NOT invent requirement IDs that were not in requirement_extraction output. '
+        'CRITICAL: output ONLY a single compact JSON object — no preamble, no markdown, '
+        'no trailing text. Stop after the closing brace.'
+    ),
     "conflict_detection": (
         'content MUST include "conflicts" (list of {id, severity, a, b, detail}) '
         'where a and b are the two contradicting requirement IDs. '
         'Return an empty list if no real contradictions exist. '
         'Do NOT list missing requirements — that is missing_requirement\'s job.'
     ),
+    "acceptance_criteria": (
+        'content MUST include "criteria" (list of {id, requirement_id, scenario, expected}). '
+        'id format: AC-1, AC-2, etc. requirement_id MUST match an existing REQ-x.y. '
+        'Limit to at most 6 criteria. Keep scenario under 30 words. '
+        'CRITICAL: output ONLY a single compact JSON object — no preamble, no markdown, '
+        'no trailing text. Stop after the closing brace.'
+    ),
     "api_specification": (
         'content MUST include "endpoints" (list of {method, path, request_schema, '
         'response_schema, status_codes, auth_required, idempotency_key_required}). '
-        'All paths MUST start with /v1/.'
+        'All paths MUST start with /v1/. '
+        'status_codes MUST include at least 200, 400, 401, and 429.'
+    ),
+    "effort_estimation": (
+        'content MUST include "estimates" (list of {task_id, item, points_or_days, rationale}). '
+        'task_id MUST match an ID from task_decomposition output. '
+        'Provide an estimate for EVERY task in task_decomposition. '
+        'Keep rationale under 15 words per item.'
     ),
     "hallucination_validation": (
         'content MUST include three lists: "fabricated_apis" (endpoints not traceable '
         'to requirements), "id_mismatches" (story/task IDs referenced but not defined '
         'in their source agent), "false_claims" (statements contradicted by the '
         'requirements text). Do NOT flag legitimate system components or technologies '
-        'mentioned in the requirements (e.g. PostgreSQL, FastAPI, React) as hallucinations.'
+        'mentioned in the requirements (e.g. PostgreSQL, FastAPI, React, Zendesk, Power BI) as hallucinations.'
     ),
     "traceability": (
         'content MUST include "links" (list of {requirement_id, story_ids, task_ids, '
-        'api_ids, test_ids}). Use the EXACT requirement IDs from requirement_extraction '
-        'output (e.g. REQ-3.1). Do NOT invent new ID schemes.'
+        'api_ids, test_ids}). '
+        'requirement_id MUST be an exact REQ-x.y ID from requirement_extraction output. '
+        'story_ids MUST be exact STY-x.y IDs from user_story_generation output. '
+        'task_ids MUST be exact TASK-x.y IDs from task_decomposition output. '
+        'test_ids MUST be exact TC-N IDs from test_case_generation output. '
+        'Do NOT invent new ID schemes (no STORY-N, no TASK-N).'
+    ),
+    "dependency_mapping": (
+        'content MUST include "dependencies" (list of {from_id, to_id, dependency_type, reason}) '
+        'and "critical_path" (ordered list of task IDs). '
+        'from_id and to_id MUST be exact TASK-x.y IDs from task_decomposition output. '
+        'Do NOT use REQ IDs or invented IDs as task references.'
+    ),
+    "sprint_planning": (
+        'content MUST include "sprints" (list of {id, name, goal, duration_weeks, items}). '
+        'items entries MUST reference task IDs from task_decomposition. '
+        'Honour constraints.sprint_duration_weeks for each sprint and '
+        'constraints.project_duration_weeks for the total horizon. '
+        'Cap each sprint at 40 story points.'
     ),
     "team_allocation": (
         'content MUST include "assignments" (list of {task_id, role, owner, '
@@ -242,6 +310,16 @@ class SDLCSpecAgent:
             self.spec.id,
             _ARTIFACT_HINTS.get(artifact, 'content must be a JSON object with structured lists.'),
         )
+        # For agents that are known to produce truncated responses (ambiguity_detection,
+        # missing_requirement, acceptance_criteria), add an explicit size constraint so
+        # the model stops generating before hitting the output token limit mid-JSON.
+        _COMPACT_AGENTS = {"ambiguity_detection", "missing_requirement", "acceptance_criteria"}
+        size_note = (
+            "\n- Keep the entire JSON response under 1500 characters. "
+            "Prefer fewer, shorter entries over a long exhaustive list."
+            if self.spec.id in _COMPACT_AGENTS
+            else ""
+        )
         return f"""
 You are the {self.spec.title} in an AI SDLC Copilot pipeline.
 Purpose: {self.spec.purpose}
@@ -260,7 +338,7 @@ CRITICAL — response format:
 - Return ONLY one JSON object. No markdown code fences. No text before or after the JSON.
 - Required keys exactly: content, risks, assumptions, confidence
 - content MUST be a JSON object (not a top-level array).
-- risks and assumptions MUST be arrays of strings (can be empty []).
+- risks and assumptions MUST be arrays of strings (can be empty []).{size_note}
 - Example:
 {{"content": {{"items": ["example"]}}, "risks": [], "assumptions": [], "confidence": 0.9}}
 """.strip()

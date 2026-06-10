@@ -12,6 +12,10 @@ const state = {
   recordChunks: [],
   speechRecognition: null,
   listening: false,
+  forceRefresh: false,
+  currentRunId: null,
+  totalAgents: 22,
+  completedCount: 0,
 };
 
 const el = {
@@ -30,6 +34,7 @@ const el = {
   voice: $("#btn-voice"),
   attachments: $("#attachments"),
   newChat: $("#btn-new"),
+  forceRefresh: $("#force-refresh"),
 };
 
 function ext(name) {
@@ -91,6 +96,7 @@ function buildFormData(message, files = state.files) {
   const fd = new FormData();
   fd.append("message", message);
   fd.append("project_name", "PRISM Project");
+  fd.append("force_refresh", state.forceRefresh ? "true" : "false");
   files.forEach((f) => fd.append("files", f));
   return fd;
 }
@@ -155,12 +161,14 @@ function initSteps(agents) {
   });
 }
 
-function setStepStatus(agentId, status) {
+function setStepStatus(agentId, status, options = {}) {
   const li = el.stepList.querySelector(`[data-id="${agentId}"]`);
   if (!li) return;
-  li.className = status;
+  const classes = [status];
+  if (options.cached) classes.push("cached");
+  li.className = classes.join(" ");
   const icon = li.querySelector(".step-icon");
-  if (status === "done") icon.textContent = "✓";
+  if (status === "done") icon.textContent = options.cached ? "⟳" : "✓";
   else if (status === "failed") icon.textContent = "!";
   else if (status === "active") icon.textContent = "◌";
 }
@@ -227,18 +235,71 @@ async function streamPipeline(formData) {
   showProgress(true);
   el.progressSub.textContent = "Starting agents…";
   el.progressBar.style.width = "0%";
+  state.completedCount = 0;
 
   const res = await fetch("/api/ayra/runs/stream", { method: "POST", body: formData });
+  await consumeSse(res, defaultSseHandlers());
+}
+
+function defaultSseHandlers() {
+  return {
+    workflow: (data) => {
+      const agents = data.agents || [];
+      state.totalAgents = data.total || agents.length;
+      initSteps(agents);
+      state.workflow = agents;
+      el.progressSub.textContent = `0 / ${state.totalAgents} agents`;
+    },
+    progress: (data) => {
+      const { agent_id, title, cached = false, completed: doneIds = [], errors = {} } = data;
+      doneIds.forEach((id) => setStepStatus(id, errors[id] ? "failed" : "done"));
+      if (agent_id) setStepStatus(agent_id, errors[agent_id] ? "failed" : "active", { cached });
+      state.completedCount = doneIds.length;
+      el.progressSub.textContent = (cached ? "(cached) " : "") + (title || agent_id);
+      const total = state.totalAgents || 22;
+      el.progressBar.style.width = `${Math.min(100, Math.round((state.completedCount / total) * 100))}%`;
+    },
+    requires_input: async (data) => {
+      state.currentRunId = data.run_id;
+      await promptForPlan(data);
+    },
+    requires_team_review: async (data) => {
+      state.currentRunId = data.run_id;
+      await promptForTeamReview(data);
+    },
+    done: (data) => {
+      el.progressBar.style.width = "100%";
+      el.progressSub.textContent = "Complete";
+      showProgress(false);
+      if (data.workflow?.length) state.workflow = data.workflow;
+      state.currentRunId = null;
+      renderResults(data);
+    },
+    error: (data) => {
+      throw new Error(data.detail || "Pipeline error");
+    },
+    agent_error: (data) => {
+      const { agent_id, title, error } = data;
+      setStepStatus(agent_id, "failed");
+      const banner = document.createElement("div");
+      banner.className = "agent-error-banner";
+      banner.innerHTML = `<strong>&#9888; Agent failed: ${title || agent_id}</strong><br><code>${error}</code>`;
+      el.messages.hidden = false;
+      el.messages.appendChild(banner);
+      el.messages.scrollTop = el.messages.scrollHeight;
+      console.error("[agent_error]", agent_id, error);
+    },
+  };
+}
+
+async function consumeSse(res, handlers) {
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
-    throw new Error(err.detail || `Pipeline failed (${res.status})`);
+    throw new Error(err.detail || `Request failed (${res.status})`);
   }
-
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
-  let total = state.workflow.length || 22;
-  let completed = 0;
 
   while (true) {
     const { done, value } = await reader.read();
@@ -250,37 +311,207 @@ async function streamPipeline(formData) {
     for (const block of parts) {
       const event = parseSseBlock(block);
       if (!event) continue;
-
-      if (event.event === "workflow") {
-        const agents = event.data.agents || [];
-        total = event.data.total || agents.length;
-        initSteps(agents);
-        state.workflow = agents;
-        el.progressSub.textContent = `0 / ${total} agents`;
-      }
-
-      if (event.event === "progress") {
-        const { agent_id, title, completed: doneIds = [], errors = {} } = event.data;
-        doneIds.forEach((id) => setStepStatus(id, errors[id] ? "failed" : "done"));
-        if (agent_id) setStepStatus(agent_id, errors[agent_id] ? "failed" : "active");
-        completed = doneIds.length;
-        el.progressSub.textContent = title || agent_id;
-        el.progressBar.style.width = `${Math.min(100, Math.round((completed / total) * 100))}%`;
-      }
-
-      if (event.event === "error") {
-        throw new Error(event.data.detail || "Pipeline error");
-      }
-
-      if (event.event === "done") {
-        el.progressBar.style.width = "100%";
-        el.progressSub.textContent = "Complete";
-        showProgress(false);
-        if (event.data.workflow?.length) state.workflow = event.data.workflow;
-        renderResults(event.data);
+      const handler = handlers[event.event];
+      if (handler) {
+        const result = handler(event.data);
+        if (result && typeof result.then === "function") {
+          await result;
+        }
       }
     }
   }
+}
+
+function promptForPlan(data) {
+  return new Promise((resolve, reject) => {
+    const old = el.progressPanel.querySelector(".hitl-form");
+    if (old) old.remove();
+
+    const form = document.createElement("div");
+    form.className = "hitl-form";
+    form.innerHTML = `
+      <h3>Sprint &amp; project planning</h3>
+      <p class="hitl-hint">${
+        data.cached ? "Loaded cached requirement analysis. " : ""
+      }Confirm sprint length and overall project horizon before sprint_planning runs.</p>
+      <div class="field-row">
+        <label class="field">
+          Sprint duration (weeks)
+          <input type="number" id="hitl-sprint" min="1" max="8" step="1"
+            value="${data.suggested_sprint_duration_weeks || 2}" />
+        </label>
+        <label class="field">
+          Project duration (weeks)
+          <input type="number" id="hitl-project" min="1" max="104" step="1"
+            value="${data.suggested_project_duration_weeks || 12}" />
+        </label>
+      </div>
+      <div class="hitl-actions">
+        <button type="button" class="hitl-btn" id="hitl-continue">Continue</button>
+      </div>
+    `;
+    el.progressPanel.appendChild(form);
+    el.progressSub.textContent = "Waiting for sprint plan input…";
+
+    const btn = form.querySelector("#hitl-continue");
+    btn.addEventListener("click", async () => {
+      const sprint = parseInt(form.querySelector("#hitl-sprint").value, 10);
+      const project = parseInt(form.querySelector("#hitl-project").value, 10);
+      if (!sprint || !project || sprint < 1 || project < 1) {
+        toast("Enter positive sprint and project durations.", true);
+        return;
+      }
+      btn.disabled = true;
+      btn.textContent = "Running…";
+
+      const fd = new FormData();
+      fd.append("sprint_duration_weeks", String(sprint));
+      fd.append("project_duration_weeks", String(project));
+
+      try {
+        const res = await fetch(`/api/ayra/runs/${data.run_id}/plan`, {
+          method: "POST",
+          body: fd,
+        });
+        form.remove();
+        await consumeSse(res, defaultSseHandlers());
+        resolve();
+      } catch (err) {
+        reject(err);
+      }
+    });
+  });
+}
+
+function promptForTeamReview(data) {
+  return new Promise((resolve, reject) => {
+    const old = el.progressPanel.querySelector(".hitl-form");
+    if (old) old.remove();
+
+    const roles = ["Developer", "QA", "DevOps", "PM", "Designer"];
+    const initialAssignments = Array.isArray(data.assignments) ? data.assignments : [];
+    const tasks = Array.isArray(data.tasks) ? data.tasks : [];
+    const taskIds = Array.from(
+      new Set([
+        ...tasks.map((t) => String(t.id || t.task_id || "")).filter(Boolean),
+        ...initialAssignments.map((a) => String(a.task_id || "")).filter(Boolean),
+      ]),
+    );
+
+    const form = document.createElement("div");
+    form.className = "hitl-form";
+    form.innerHTML = `
+      <h3>Review team allocation</h3>
+      <p class="hitl-hint">PRISM proposed the assignments below. Edit any cell, add or remove rows, then finalize.</p>
+      <div class="assignments-wrap">
+        <table class="assignments-table">
+          <thead>
+            <tr>
+              <th>Task ID</th>
+              <th>Role</th>
+              <th>Owner</th>
+              <th>Est. hours</th>
+              <th aria-label="Remove"></th>
+            </tr>
+          </thead>
+          <tbody id="assignments-body"></tbody>
+        </table>
+      </div>
+      <div class="hitl-actions" style="justify-content: space-between;">
+        <button type="button" class="hitl-btn hitl-btn-secondary" id="hitl-add-row">+ Add row</button>
+        <button type="button" class="hitl-btn" id="hitl-finalize">Finalize</button>
+      </div>
+    `;
+    el.progressPanel.appendChild(form);
+    el.progressSub.textContent = "Waiting for team allocation review…";
+
+    const tbody = form.querySelector("#assignments-body");
+
+    function buildRow(a = {}) {
+      const tr = document.createElement("tr");
+      const roleOptions = roles
+        .map(
+          (r) =>
+            `<option value="${r}"${(a.role || "Developer") === r ? " selected" : ""}>${r}</option>`,
+        )
+        .join("");
+
+      const currentTaskId = String(a.task_id || "");
+      let taskIdCell;
+      if (taskIds.length > 0) {
+        const options = taskIds
+          .map(
+            (id) =>
+              `<option value="${escapeHtml(id)}"${id === currentTaskId ? " selected" : ""}>${escapeHtml(id)}</option>`,
+          )
+          .join("");
+        const customOption =
+          currentTaskId && !taskIds.includes(currentTaskId)
+            ? `<option value="${escapeHtml(currentTaskId)}" selected>${escapeHtml(currentTaskId)}</option>`
+            : "";
+        taskIdCell = `<td><select class="cell-task">${customOption}${options}</select></td>`;
+      } else {
+        taskIdCell = `<td><input type="text" class="cell-task" placeholder="T-1"
+          value="${escapeHtml(currentTaskId)}" /></td>`;
+      }
+
+      tr.innerHTML = `
+        ${taskIdCell}
+        <td><select class="cell-role">${roleOptions}</select></td>
+        <td><input type="text" class="cell-owner" value="${escapeHtml(a.owner || "TBD")}" /></td>
+        <td><input type="number" class="cell-hours" min="0" step="0.5"
+          value="${Number.isFinite(+a.estimated_hours) ? +a.estimated_hours : 8}" /></td>
+        <td><button type="button" class="row-remove" aria-label="Remove row">×</button></td>
+      `;
+      tr.querySelector(".row-remove").addEventListener("click", () => tr.remove());
+      return tr;
+    }
+
+    const initialRows = initialAssignments.length > 0
+      ? initialAssignments
+      : taskIds.length > 0
+        ? taskIds.map((id) => ({ task_id: id }))
+        : [{}];
+    initialRows.forEach((a) => tbody.appendChild(buildRow(a)));
+
+    form.querySelector("#hitl-add-row").addEventListener("click", () => {
+      tbody.appendChild(buildRow({}));
+    });
+
+    const btn = form.querySelector("#hitl-finalize");
+    btn.addEventListener("click", async () => {
+      const edited = Array.from(tbody.querySelectorAll("tr")).map((tr) => ({
+        task_id: (tr.querySelector(".cell-task").value || "").trim(),
+        role: tr.querySelector(".cell-role").value,
+        owner: (tr.querySelector(".cell-owner").value || "").trim(),
+        estimated_hours: parseFloat(tr.querySelector(".cell-hours").value) || 0,
+      }));
+
+      btn.disabled = true;
+      btn.textContent = "Finalizing…";
+
+      try {
+        const res = await fetch(`/api/ayra/runs/${data.run_id}/finalize`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ assignments: edited }),
+        });
+        form.remove();
+        await consumeSse(res, defaultSseHandlers());
+        resolve();
+      } catch (err) {
+        reject(err);
+      }
+    });
+  });
+}
+
+function escapeHtml(value) {
+  return String(value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
 }
 
 function parseSseBlock(block) {
@@ -500,6 +731,10 @@ function resetChat() {
   el.welcome.hidden = false;
   el.progressPanel.hidden = true;
   el.chips.hidden = false;
+  state.currentRunId = null;
+  state.completedCount = 0;
+  const oldForm = el.progressPanel.querySelector(".hitl-form");
+  if (oldForm) oldForm.remove();
   clearComposer();
 }
 
@@ -518,8 +753,16 @@ el.input.addEventListener("keydown", (e) => {
 
 el.send.addEventListener("click", handleSend);
 el.upload.addEventListener("click", () => el.fileInput.click());
-el.fileInput.addEventListener("change", (e) => onFilesSelected(e.target.files));
+el.fileInput.addEventListener("change", (e) => {
+  onFilesSelected(e.target.files);
+  e.target.value = "";   // reset so same file can be re-selected
+});
 el.newChat.addEventListener("click", resetChat);
+if (el.forceRefresh) {
+  el.forceRefresh.addEventListener("change", (e) => {
+    state.forceRefresh = !!e.target.checked;
+  });
+}
 
 document.querySelectorAll(".chip").forEach((chip) => {
   chip.addEventListener("click", () => {
