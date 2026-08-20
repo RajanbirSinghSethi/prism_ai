@@ -58,6 +58,7 @@ class Settings(BaseSettings):
     github_token: str | None = Field(default=None, validation_alias="GITHUB_TOKEN")
     sdlc_log_level: str = Field(default="INFO", validation_alias="SDLC_LOG_LEVEL")
     whisper_model: str = Field(default="base", validation_alias="WHISPER_MODEL")
+    otel_enabled: bool = Field(default=False, validation_alias="OTEL_ENABLED")
 
 
 @lru_cache(maxsize=1)

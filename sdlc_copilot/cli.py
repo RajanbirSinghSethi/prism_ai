@@ -14,6 +14,7 @@ from sdlc_copilot.ingestion.loaders import load_path
 from sdlc_copilot.logging_config import configure_logging
 from sdlc_copilot.models import PipelineRequest, SourceDocument
 from sdlc_copilot.services.pipeline import SDLCPipelineService
+from sdlc_copilot.telemetry import configure_telemetry
 
 app = typer.Typer(help="AI SDLC Copilot CLI")
 console = Console(stderr=True)
@@ -24,10 +25,13 @@ def _main(
     verbose: bool = typer.Option(False, "--verbose", "-v", help="DEBUG logs on stderr"),
 ) -> None:
     """Configure logging before any subcommand runs."""
+    settings = get_settings()
     if verbose:
         configure_logging("DEBUG")
     else:
-        configure_logging(get_settings().sdlc_log_level)
+        configure_logging(settings.sdlc_log_level)
+    if settings.otel_enabled:
+        configure_telemetry()
 
 
 @app.command()

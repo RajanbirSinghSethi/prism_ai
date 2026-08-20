@@ -20,6 +20,7 @@ from sdlc_copilot.integrations.exporters import export_csv, export_pdf
 from sdlc_copilot.logging_config import configure_logging
 from sdlc_copilot.models import PipelineRequest, PipelineResponse
 from sdlc_copilot.services.pipeline import SDLCPipelineService
+from sdlc_copilot.telemetry import configure_telemetry, instrument_fastapi_app
 
 log = logging.getLogger(__name__)
 
@@ -39,6 +40,8 @@ except Exception as _settings_exc:  # noqa: BLE001
 async def lifespan(_app: FastAPI):
     if settings is not None:
         configure_logging(settings.sdlc_log_level)
+        if settings.otel_enabled:
+            configure_telemetry()
         log.info("%s v%s starting (LLM_PROVIDER=%s)", settings.app_name, __version__, settings.llm_provider)
     yield
     if settings is not None:
@@ -52,6 +55,9 @@ app = FastAPI(
 )
 
 app.include_router(ayra_router)
+
+if settings is not None and settings.otel_enabled:
+    instrument_fastapi_app(app)
 
 
 @app.get("/", include_in_schema=False)

@@ -26,7 +26,7 @@ sdlc-copilot interactive                            # end text with .END
 ```
 
 **Required `.env`:** `LLM_PROVIDER`, `OPENROUTER_API_KEY`, `OPENROUTER_MODEL`, `GOOGLE_API_KEY`
-**Optional:** `USE_LANGGRAPH=true`, `CONFIDENCE_THRESHOLD=0.6`, `GROQ_*`, `JIRA_*`, `GITHUB_TOKEN`
+**Optional:** `USE_LANGGRAPH=true`, `CONFIDENCE_THRESHOLD=0.6`, `GROQ_*`, `JIRA_*`, `GITHUB_TOKEN`, `OTEL_ENABLED=true`
 
 ## Architecture
 
@@ -34,6 +34,7 @@ sdlc-copilot interactive                            # end text with .END
 sdlc_copilot/
   main.py          # FastAPI: GET /health /agents /runs/{id} /runs/{id}/export, POST /runs /runs/upload
   config.py        # Settings (pydantic-settings, lru_cache); use_langgraph + confidence_threshold flags
+  telemetry.py     # OpenTelemetry MVP bootstrap; gated by otel_enabled, console exporter
   models.py        # PipelineRequest/State/Response, AgentOutput, ArtifactType, LangGraphState
   agents/
     specs.py       # 27 AgentSpec definitions
@@ -66,3 +67,4 @@ tests/             # 111 tests; conftest.py has mock_llm, low_confidence_llm, sa
 - **prism_ui (static frontend)**: vanilla HTML/JS served by FastAPI; consumes SSE from `/api/ayra/runs/stream` → `/runs/{id}/plan` → `/runs/{id}/finalize` and shares a `consumeSse(response, handlers)` helper across phases.
 - **Phased HITL flow**: head (17 agents, ends at `traceability`) → `requires_input` (sprint + project duration form) → mid (`sprint_planning`, `team_allocation`) → `requires_team_review` (editable assignments table) → tail (`devops_recommendation`, `compliance`, `export_integration`) → `done`. Artifact is written exactly once at the end.
 - **Filename-keyed cache**: head-agent outputs are persisted to `.data/cache/{filename}.json` (lowercased; multi-file = sorted-joined with `|`). Repeat uploads of the same filename(s) replay cached outputs without LLM calls. Raw-text-only requests are not cached. UI "Force refresh" checkbox deletes the cache file before phase 1; cache is always written through on success.
+- **OpenTelemetry (MVP)**: `OTEL_ENABLED=true` wires FastAPI + httpx + logging auto-instrumentation with a console span exporter (`sdlc_copilot/telemetry.py`). No manual spans/metrics or OTLP export yet — planned follow-up: spans on `SDLCSpecAgent._invoke`, orchestrator agent nodes, and pipeline phases, plus retry/cache/confidence metrics.
